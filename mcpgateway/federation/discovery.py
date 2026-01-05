@@ -81,6 +81,7 @@ from mcpgateway import __version__
 from mcpgateway.common.models import ServerCapabilities
 from mcpgateway.config import settings
 from mcpgateway.services.logging_service import LoggingService
+from mcpgateway.services import task_scheduler, Priority
 
 # Initialize logging service first
 logging_service = LoggingService()
@@ -328,8 +329,8 @@ class DiscoveryService(LocalDiscoveryService):
                 )
 
             # Start background tasks
-            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
-            self._refresh_task = asyncio.create_task(self._refresh_loop())
+            self._cleanup_task = task_scheduler.schedule(self._cleanup_loop, Priority.NORMAL)
+            self._refresh_task = task_scheduler.schedule(self._refresh_loop, Priority.LOW)
 
             # Load static peers
             for peer_url in settings.federation_peers:
