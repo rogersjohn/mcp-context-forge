@@ -53,6 +53,7 @@ from mcpgateway.db import Gateway as DbGateway
 from mcpgateway.db import server_tool_association
 from mcpgateway.db import Tool as DbTool
 from mcpgateway.db import ToolMetric, ToolMetricsHourly
+from mcpgateway.db import get_for_update
 from mcpgateway.observability import create_span
 from mcpgateway.plugins.framework import (
     GlobalContext,
@@ -1998,7 +1999,8 @@ class ToolService:
             >>> asyncio.run(service.delete_tool(db, 'tool_id'))
         """
         try:
-            tool = db.get(DbTool, tool_id)
+            #tool = db.get(DbTool, tool_id)
+            tool = get_for_update(db, DbTool, tool_id)
             if not tool:
                 raise ToolNotFoundError(f"Tool not found: {tool_id}")
 
@@ -2146,6 +2148,7 @@ class ToolService:
         """
         try:
             tool = db.get(DbTool, tool_id)
+            tool = get_for_update(db, DbTool, tool_id)
             if not tool:
                 raise ToolNotFoundError(f"Tool not found: {tool_id}")
 
@@ -3060,7 +3063,9 @@ class ToolService:
             'tool_read'
         """
         try:
-            tool = db.get(DbTool, tool_id)
+            #tool = db.get(DbTool, tool_id)
+            tool = get_for_update(db, DbTool, tool_id)
+
             if not tool:
                 raise ToolNotFoundError(f"Tool not found: {tool_id}")
 
@@ -3081,7 +3086,7 @@ class ToolService:
                 # Check for existing tool with the same name and visibility
                 if tool_update.visibility.lower() == "public":
                     # Check for existing public tool with the same name
-                    existing_tool = db.execute(select(DbTool).where(DbTool.custom_name == tool_update.custom_name, DbTool.visibility == "public")).scalar_one_or_none()
+                    existing_tool = db.execute(select(DbTool).where(DbTool.custom_name == tool_update.custom_name, DbTool.visibility == "public",DbTool.id != tool.id)).scalar_one_or_none()
                     if existing_tool:
                         raise ToolNameConflictError(existing_tool.custom_name, enabled=existing_tool.enabled, tool_id=existing_tool.id, visibility=existing_tool.visibility)
                 elif tool_update.visibility.lower() == "team" and tool_update.team_id:
