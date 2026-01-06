@@ -51,7 +51,7 @@ from mcpgateway.db import (
 )
 
 logger = logging.getLogger(__name__)
-from mcpgateway.services import task_scheduler, Priority  # noqa: E402
+from mcpgateway.services import task_scheduler, Priority  # noqa: E402  # pylint: disable=wrong-import-position
 
 
 @dataclass
