@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 
 # Third-Party
 from sqlalchemy import and_, case, delete, func, select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 # First-Party
@@ -492,7 +493,6 @@ class MetricsRollupService:
                             hour_end,
                             is_a2a,
                         )
-
                         # Upsert rollups
                         for agg in aggregations:
                             created, updated = self._upsert_rollup(
@@ -568,332 +568,202 @@ class MetricsRollupService:
 
         Returns:
             List[HourlyAggregation]: Aggregated metrics for each entity
+
+        Raises:
+            Exception: If aggregation fails due to a database query or processing error.
         """
-        entity_id_attr = getattr(raw_model, entity_id_col)
+        try:
+            entity_id_attr = getattr(raw_model, entity_id_col)
+            entity_name_attr = getattr(entity_model, entity_name_col)
 
-        # Build group by columns
-        if is_a2a:
-            group_cols = [entity_id_attr, raw_model.interaction_type]
-        else:
-            group_cols = [entity_id_attr]
-
-        # Time filter for this hour
-        time_filter = and_(
-            raw_model.timestamp >= hour_start,
-            raw_model.timestamp < hour_end,
-        )
-
-        # OPTIMIZED: Single bulk query for basic aggregations per entity
-        # pylint: disable=not-callable
-        agg_query = (
-            select(
-                *group_cols,
-                func.count(raw_model.id).label("total_count"),
-                func.sum(case((raw_model.is_success.is_(True), 1), else_=0)).label("success_count"),
-                func.min(raw_model.response_time).label("min_rt"),
-                func.max(raw_model.response_time).label("max_rt"),
-                func.avg(raw_model.response_time).label("avg_rt"),
+            time_filter = and_(
+                raw_model.timestamp >= hour_start,
+                raw_model.timestamp < hour_end,
             )
-            .where(time_filter)
-            .group_by(*group_cols)
-        )
 
-        # Store aggregation results by entity key
-        agg_results = {}
-        for row in db.execute(agg_query).fetchall():
-            entity_id = row[0]
-            interaction_type = row[1] if is_a2a else None
-            key = (entity_id, interaction_type) if is_a2a else entity_id
+            aggregations: list = []
+            if self._is_postgresql and settings.use_postgresdb_percentiles:
+                # ---- build SELECT and GROUP BY dynamically (CRITICAL FIX) ----
+                select_cols = [
+                    entity_id_attr.label("entity_id"),
+                    func.coalesce(entity_name_attr, "unknown").label("entity_name"),
+                ]
+                group_by_cols = [
+                    entity_id_attr,
+                    entity_name_attr,
+                ]
 
-            agg_results[key] = {
-                "entity_id": entity_id,
-                "interaction_type": interaction_type,
-                "total_count": row.total_count or 0,
-                "success_count": row.success_count or 0,
-                "min_rt": row.min_rt,
-                "max_rt": row.max_rt,
-                "avg_rt": row.avg_rt,
-            }
+                if is_a2a:
+                    select_cols.append(raw_model.interaction_type.label("interaction_type"))
+                    group_by_cols.append(raw_model.interaction_type)
 
-        if not agg_results:
-            return []
-
-        # OPTIMIZED: Bulk load entity names in one query
-        entity_ids = list(set(r["entity_id"] for r in agg_results.values()))
-        entity_names = {}
-        if entity_ids:
-            entities = db.execute(select(entity_model.id, getattr(entity_model, entity_name_col)).where(entity_model.id.in_(entity_ids))).fetchall()
-            entity_names = {e[0]: e[1] for e in entities}
-
-        # OPTIMIZED: Bulk load all response times for percentile calculation
-        # Load all response times for the hour in one query, grouped by entity
-        rt_query = (
-            select(
-                *group_cols,
-                raw_model.response_time,
-            )
-            .where(time_filter)
-            .order_by(*group_cols, raw_model.response_time)
-        )
-
-        # Group response times by entity
-        response_times_by_entity: Dict[Any, List[float]] = {}
-        for row in db.execute(rt_query).fetchall():
-            entity_id = row[0]
-            interaction_type = row[1] if is_a2a else None
-            key = (entity_id, interaction_type) if is_a2a else entity_id
-            rt = row.response_time if not is_a2a else row[2]
-
-            if key not in response_times_by_entity:
-                response_times_by_entity[key] = []
-            if rt is not None:
-                response_times_by_entity[key].append(rt)
-
-        # Build aggregation results with percentiles
-        aggregations = []
-        for key, agg in agg_results.items():
-            entity_id = agg["entity_id"]
-            interaction_type = agg["interaction_type"]
-
-            # Get entity name
-            entity_name = entity_names.get(entity_id, "unknown")
-
-            # Get response times for percentile calculation
-            response_times = response_times_by_entity.get(key, [])
-
-            # Calculate percentiles (response_times are already sorted from ORDER BY)
-            if response_times:
-                p50_rt = self._percentile(response_times, 50)
-                p95_rt = self._percentile(response_times, 95)
-                p99_rt = self._percentile(response_times, 99)
+                agg_query = (
+                    select(
+                        *select_cols,
+                        func.count(raw_model.id).label("total_count"),
+                        func.sum(case((raw_model.is_success.is_(True), 1), else_=0)).label("success_count"),
+                        func.min(raw_model.response_time).label("min_rt"),
+                        func.max(raw_model.response_time).label("max_rt"),
+                        func.avg(raw_model.response_time).label("avg_rt"),
+                        func.percentile_cont(0.50).within_group(raw_model.response_time).label("p50_rt"),
+                        func.percentile_cont(0.95).within_group(raw_model.response_time).label("p95_rt"),
+                        func.percentile_cont(0.99).within_group(raw_model.response_time).label("p99_rt"),
+                    )
+                    .select_from(raw_model)
+                    .join(entity_model, entity_model.id == entity_id_attr, isouter=True)
+                    .where(
+                        time_filter,
+                        raw_model.response_time.isnot(None),
+                    )
+                    .group_by(*group_by_cols)
+                )
+                for row in db.execute(agg_query):
+                    aggregations.append(
+                        HourlyAggregation(
+                            entity_id=row.entity_id,
+                            entity_name=row.entity_name,
+                            hour_start=hour_start,
+                            total_count=row.total_count,
+                            success_count=row.success_count,
+                            failure_count=row.total_count - row.success_count,
+                            min_response_time=row.min_rt,
+                            max_response_time=row.max_rt,
+                            avg_response_time=row.avg_rt,
+                            p50_response_time=row.p50_rt,
+                            p95_response_time=row.p95_rt,
+                            p99_response_time=row.p99_rt,
+                            interaction_type=row.interaction_type if is_a2a else None,
+                        )
+                    )
             else:
-                p50_rt = p95_rt = p99_rt = None
-
-            aggregations.append(
-                HourlyAggregation(
-                    entity_id=entity_id,
-                    entity_name=entity_name,
-                    hour_start=hour_start,
-                    total_count=agg["total_count"],
-                    success_count=agg["success_count"],
-                    failure_count=agg["total_count"] - agg["success_count"],
-                    min_response_time=agg["min_rt"],
-                    max_response_time=agg["max_rt"],
-                    avg_response_time=agg["avg_rt"],
-                    p50_response_time=p50_rt,
-                    p95_response_time=p95_rt,
-                    p99_response_time=p99_rt,
-                    interaction_type=interaction_type,
-                )
-            )
-
-        return aggregations
-    
-    def _aggregate_hour_updated(
-        self,
-        db: Session,
-        raw_model: Type,
-        entity_model: Type,
-        entity_id_col: str,
-        entity_name_col: str,
-        hour_start: datetime,
-        hour_end: datetime,
-        is_a2a: bool,
-    ) -> List[HourlyAggregation]:
-        """Aggregate raw metrics for a single hour using optimized bulk queries.
-
-        Uses a single GROUP BY query to get basic aggregations (count, min, max, avg,
-        success count) for all entities at once, minimizing database round trips.
-        Percentiles are calculated by loading response times in a single bulk query.
-
-        Args:
-            db: Database session
-            raw_model: SQLAlchemy model for raw metrics
-            entity_model: SQLAlchemy model for the entity
-            entity_id_col: Name of the entity ID column
-            entity_name_col: Name of the entity name column
-            hour_start: Start of the hour
-            hour_end: End of the hour
-            is_a2a: Whether this is A2A agent metrics (has interaction_type)
-
-        Returns:
-            List[HourlyAggregation]: Aggregated metrics for each entity
-        """
-        entity_id_attr = getattr(raw_model, entity_id_col)
-
-        # Build group by columns
-        if is_a2a:
-            group_cols = [entity_id_attr, raw_model.interaction_type]
-        else:
-            group_cols = [entity_id_attr]
-
-        # Time filter for this hour
-        time_filter = and_(
-            raw_model.timestamp >= hour_start,
-            raw_model.timestamp < hour_end,
-        )
-        aggregations = []
-        if not self._is_postgresql:
-            # OPTIMIZED: Single bulk query for basic aggregations per entity
-            # pylint: disable=not-callable
-            
-            agg_query = (
-                select(
-                    *group_cols,
-                    func.count(raw_model.id).label("total_count"),
-                    func.sum(case((raw_model.is_success.is_(True), 1), else_=0)).label("success_count"),
-                    func.min(raw_model.response_time).label("min_rt"),
-                    func.max(raw_model.response_time).label("max_rt"),
-                    func.avg(raw_model.response_time).label("avg_rt"),
-                )
-                .where(time_filter)
-                .group_by(*group_cols)
-            )
-
-            # Store aggregation results by entity key
-            agg_results = {}
-            for row in db.execute(agg_query).fetchall():
-                entity_id = row[0]
-                interaction_type = row[1] if is_a2a else None
-                key = (entity_id, interaction_type) if is_a2a else entity_id
-
-                agg_results[key] = {
-                    "entity_id": entity_id,
-                    "interaction_type": interaction_type,
-                    "total_count": row.total_count or 0,
-                    "success_count": row.success_count or 0,
-                    "min_rt": row.min_rt,
-                    "max_rt": row.max_rt,
-                    "avg_rt": row.avg_rt,
-                }
-
-            if not agg_results:
-                return []
-
-            # OPTIMIZED: Bulk load entity names in one query
-            entity_ids = list(set(r["entity_id"] for r in agg_results.values()))
-            entity_names = {}
-            if entity_ids:
-                entities = db.execute(select(entity_model.id, getattr(entity_model, entity_name_col)).where(entity_model.id.in_(entity_ids))).fetchall()
-                entity_names = {e[0]: e[1] for e in entities}
-
-            # OPTIMIZED: Bulk load all response times for percentile calculation
-            # Load all response times for the hour in one query, grouped by entity
-            rt_query = (
-                select(
-                    *group_cols,
-                    raw_model.response_time,
-                )
-                .where(time_filter)
-                .order_by(*group_cols, raw_model.response_time)
-            )
-
-            # Group response times by entity
-            response_times_by_entity: Dict[Any, List[float]] = {}
-            for row in db.execute(rt_query).fetchall():
-                entity_id = row[0]
-                interaction_type = row[1] if is_a2a else None
-                key = (entity_id, interaction_type) if is_a2a else entity_id
-                rt = row.response_time if not is_a2a else row[2]
-
-                if key not in response_times_by_entity:
-                    response_times_by_entity[key] = []
-                if rt is not None:
-                    response_times_by_entity[key].append(rt)
-
-            # Build aggregation results with percentiles
-            for key, agg in agg_results.items():
-                entity_id = agg["entity_id"]
-                interaction_type = agg["interaction_type"]
-
-                # Get entity name
-                entity_name = entity_names.get(entity_id, "unknown")
-
-                # Get response times for percentile calculation
-                response_times = response_times_by_entity.get(key, [])
-
-                # Calculate percentiles (response_times are already sorted from ORDER BY)
-                if response_times:
-                    p50_rt = self._percentile(response_times, 50)
-                    p95_rt = self._percentile(response_times, 95)
-                    p99_rt = self._percentile(response_times, 99)
+                # Build group by columns
+                if is_a2a:
+                    group_cols = [entity_id_attr, raw_model.interaction_type]
                 else:
-                    p50_rt = p95_rt = p99_rt = None
+                    group_cols = [entity_id_attr]
 
-                aggregations.append(
-                    HourlyAggregation(
-                        entity_id=entity_id,
-                        entity_name=entity_name,
-                        hour_start=hour_start,
-                        total_count=agg["total_count"],
-                        success_count=agg["success_count"],
-                        failure_count=agg["total_count"] - agg["success_count"],
-                        min_response_time=agg["min_rt"],
-                        max_response_time=agg["max_rt"],
-                        avg_response_time=agg["avg_rt"],
-                        p50_response_time=p50_rt,
-                        p95_response_time=p95_rt,
-                        p99_response_time=p99_rt,
-                        interaction_type=interaction_type,
-                    )
-                )
-        elif self._is_postgresql:
-            agg_query = (
-                        select(
-                            *group_cols,
-                            func.count(raw_model.id).label("total_count"),
-                            func.sum(
-                                case((raw_model.is_success.is_(True), 1), else_=0)
-                            ).label("success_count"),
-                            func.min(raw_model.response_time).label("min_rt"),
-                            func.max(raw_model.response_time).label("max_rt"),
-                            func.avg(raw_model.response_time).label("avg_rt"),
-
-                            # Percentiles pushed to DB
-                            func.percentile_cont(0.50)
-                                .within_group(raw_model.response_time)
-                                .label("p50_rt"),
-                            func.percentile_cont(0.95)
-                                .within_group(raw_model.response_time)
-                                .label("p95_rt"),
-                            func.percentile_cont(0.99)
-                                .within_group(raw_model.response_time)
-                                .label("p99_rt"),
-                        )
-                        .where(
-                            and_(
-                                raw_model.timestamp >= hour_start,
-                                raw_model.timestamp < hour_end,
-                                raw_model.response_time.isnot(None),
-                            )
-                        )
-                        .group_by(*group_cols)
-                    )
-            
-            for row in db.execute(agg_query):
-                entity_id = row[0]
-                interaction_type = row[1] if is_a2a else None
-
-                aggregations.append(
-                    HourlyAggregation(
-                        entity_id=entity_id,
-                        entity_name=entity_names.get(entity_id, "unknown"),
-                        hour_start=hour_start,
-                        total_count=row.total_count,
-                        success_count=row.success_count,
-                        failure_count=row.total_count - row.success_count,
-                        min_response_time=row.min_rt,
-                        max_response_time=row.max_rt,
-                        avg_response_time=row.avg_rt,
-                        p50_response_time=row.p50_rt,
-                        p95_response_time=row.p95_rt,
-                        p99_response_time=row.p99_rt,
-                        interaction_type=interaction_type,
-                    )
+                # Time filter for this hour
+                time_filter = and_(
+                    raw_model.timestamp >= hour_start,
+                    raw_model.timestamp < hour_end,
                 )
 
-        return aggregations
+                # OPTIMIZED: Single bulk query for basic aggregations per entity
+                # pylint: disable=not-callable
+                agg_query = (
+                    select(
+                        *group_cols,
+                        func.count(raw_model.id).label("total_count"),
+                        func.sum(case((raw_model.is_success.is_(True), 1), else_=0)).label("success_count"),
+                        func.min(raw_model.response_time).label("min_rt"),
+                        func.max(raw_model.response_time).label("max_rt"),
+                        func.avg(raw_model.response_time).label("avg_rt"),
+                    )
+                    .where(time_filter)
+                    .group_by(*group_cols)
+                )
 
+                # Store aggregation results by entity key
+                agg_results = {}
+                for row in db.execute(agg_query):  # .fetchall():
+                    entity_id = row[0]
+                    interaction_type = row[1] if is_a2a else None
+                    key = (entity_id, interaction_type) if is_a2a else entity_id
+
+                    agg_results[key] = {
+                        "entity_id": entity_id,
+                        "interaction_type": interaction_type,
+                        "total_count": row.total_count or 0,
+                        "success_count": row.success_count or 0,
+                        "min_rt": row.min_rt,
+                        "max_rt": row.max_rt,
+                        "avg_rt": row.avg_rt,
+                    }
+
+                if not agg_results:
+                    return []
+
+                # OPTIMIZED: Bulk load entity names in one query
+                entity_ids = list(set(r["entity_id"] for r in agg_results.values()))
+                entity_names = {}
+                if entity_ids:
+                    entities = db.execute(select(entity_model.id, getattr(entity_model, entity_name_col)).where(entity_model.id.in_(entity_ids)))  # .fetchall()
+                    entity_names = {e[0]: e[1] for e in entities}
+
+                # OPTIMIZED: Bulk load all response times for percentile calculation
+                # Load all response times for the hour in one query, grouped by entity
+                rt_query = (
+                    select(
+                        *group_cols,
+                        raw_model.response_time,
+                    )
+                    .where(time_filter)
+                    .order_by(*group_cols, raw_model.response_time)
+                )
+
+                # Group response times by entity
+                response_times_by_entity: Dict[Any, List[float]] = {}
+                for row in db.execute(rt_query):  # .fetchall():
+                    entity_id = row[0]
+                    interaction_type = row[1] if is_a2a else None
+                    key = (entity_id, interaction_type) if is_a2a else entity_id
+                    rt = row.response_time if not is_a2a else row[2]
+
+                    if key not in response_times_by_entity:
+                        response_times_by_entity[key] = []
+                    if rt is not None:
+                        response_times_by_entity[key].append(rt)
+
+                # Build aggregation results with percentiles
+                aggregations = []
+                for key, agg in agg_results.items():
+                    entity_id = agg["entity_id"]
+                    interaction_type = agg["interaction_type"]
+
+                    # Get entity name
+                    entity_name = entity_names.get(entity_id, "unknown")
+
+                    # Get response times for percentile calculation
+                    response_times = response_times_by_entity.get(key, [])
+
+                    # Calculate percentiles (response_times are already sorted from ORDER BY)
+                    if response_times:
+                        p50_rt = self._percentile(response_times, 50)
+                        p95_rt = self._percentile(response_times, 95)
+                        p99_rt = self._percentile(response_times, 99)
+                    else:
+                        p50_rt = p95_rt = p99_rt = None
+
+                    aggregations.append(
+                        HourlyAggregation(
+                            entity_id=entity_id,
+                            entity_name=entity_name,
+                            hour_start=hour_start,
+                            total_count=agg["total_count"],
+                            success_count=agg["success_count"],
+                            failure_count=agg["total_count"] - agg["success_count"],
+                            min_response_time=agg["min_rt"],
+                            max_response_time=agg["max_rt"],
+                            avg_response_time=agg["avg_rt"],
+                            p50_response_time=p50_rt,
+                            p95_response_time=p95_rt,
+                            p99_response_time=p99_rt,
+                            interaction_type=interaction_type,
+                        )
+                    )
+            return aggregations
+        except Exception:
+            logger.exception(
+                "Failed to aggregate hourly metrics",
+                extra={
+                    "hour_start": hour_start,
+                    "hour_end": hour_end,
+                    "raw_model": raw_model.__name__,
+                    "entity_model": entity_model.__name__,
+                    "is_a2a": is_a2a,
+                },
+            )
+            raise
 
     def _percentile(self, sorted_data: List[float], percentile: int) -> float:
         """Calculate percentile from sorted data.
@@ -914,7 +784,6 @@ class MetricsRollupService:
 
         if f == c:
             return sorted_data[f]
-
         return sorted_data[f] + (k - f) * (sorted_data[c] - sorted_data[f])
 
     def _upsert_rollup(
@@ -925,19 +794,24 @@ class MetricsRollupService:
         agg: HourlyAggregation,
         is_a2a: bool,
     ) -> Tuple[int, int]:
-        """Insert or update a rollup record.
+        """
+        Insert or update a single hourly rollup record using PostgreSQL UPSERT.
 
         Args:
-            db: Database session
-            hourly_model: SQLAlchemy model for hourly rollups
-            entity_id_col: Name of the entity ID column
-            agg: Aggregation to upsert
-            is_a2a: Whether this is A2A agent metrics
+            db (Session): Active SQLAlchemy database session.
+            hourly_model (Type): ORM model representing the hourly rollup table.
+            entity_id_col (str): Name of the entity ID column (e.g. "tool_id", "agent_id").
+            agg (HourlyAggregation): Aggregated hourly metrics for a single entity.
+            is_a2a (bool): Whether interaction_type should be included in the uniqueness key.
 
         Returns:
-            Tuple[int, int]: (created count, updated count)
+            Tuple[int, int]: Best-effort (inserted_count, updated_count) values for logging only.
+
+        Raises:
+            sqlalchemy.exc.SQLAlchemyError: If the database UPSERT operation fails.
         """
-        # Build the name column based on entity type
+
+        # Resolve name column
         if entity_id_col == "tool_id":
             name_col = "tool_name"
         elif entity_id_col == "resource_id":
@@ -949,10 +823,12 @@ class MetricsRollupService:
         else:
             name_col = "agent_name"
 
+        hour_start = agg.hour_start.replace(minute=0, second=0, microsecond=0)
+
         values = {
             entity_id_col: agg.entity_id,
             name_col: agg.entity_name,
-            "hour_start": agg.hour_start,
+            "hour_start": hour_start,
             "total_count": agg.total_count,
             "success_count": agg.success_count,
             "failure_count": agg.failure_count,
@@ -967,28 +843,26 @@ class MetricsRollupService:
         if is_a2a:
             values["interaction_type"] = agg.interaction_type
 
-        # Check if rollup exists
-        entity_id_attr = getattr(hourly_model, entity_id_col)
-        filters = [
-            entity_id_attr == agg.entity_id,
-            hourly_model.hour_start == agg.hour_start,
+        stmt = insert(hourly_model).values(**values)
+
+        conflict_cols = [
+            getattr(hourly_model, entity_id_col),
+            hourly_model.hour_start,
         ]
         if is_a2a:
-            filters.append(hourly_model.interaction_type == agg.interaction_type)
+            conflict_cols.append(hourly_model.interaction_type)
 
-        existing = db.execute(select(hourly_model).where(and_(*filters))).scalar_one_or_none()
+        update_cols = {k: stmt.excluded[k] for k in values.keys() if k not in (entity_id_col, "hour_start", "interaction_type")}
 
-        if existing:
-            # Update existing
-            for key, value in values.items():
-                if key not in (entity_id_col, "hour_start", "interaction_type"):
-                    setattr(existing, key, value)
-            return (0, 1)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=conflict_cols,
+            set_=update_cols,
+        ).returning(hourly_model.id)
 
-        # Insert new
-        rollup = hourly_model(**values)
-        db.add(rollup)
-        return (1, 0)
+        db.execute(stmt)
+
+        # Best-effort counts (logging only)
+        return (0, 1)
 
     def _delete_raw_metrics(
         self,
