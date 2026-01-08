@@ -596,7 +596,7 @@ class MetricsRollupService:
                 if is_a2a:
                     select_cols.append(raw_model.interaction_type.label("interaction_type"))
                     group_by_cols.append(raw_model.interaction_type)
-
+                # pylint: disable=not-callable
                 agg_query = (
                     select(
                         *select_cols,
@@ -617,6 +617,7 @@ class MetricsRollupService:
                     )
                     .group_by(*group_by_cols)
                 )
+                # pylint: enable=not-callable
                 for row in db.execute(agg_query):
                     aggregations.append(
                         HourlyAggregation(
@@ -852,7 +853,7 @@ class MetricsRollupService:
         if is_a2a:
             conflict_cols.append(hourly_model.interaction_type)
 
-        update_cols = {k: stmt.excluded[k] for k in values.keys() if k not in (entity_id_col, "hour_start", "interaction_type")}
+        update_cols = {k: stmt.excluded[k] for k in values if k not in (entity_id_col, "hour_start", "interaction_type")}
 
         stmt = stmt.on_conflict_do_update(
             index_elements=conflict_cols,
