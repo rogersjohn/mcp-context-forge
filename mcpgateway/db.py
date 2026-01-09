@@ -5270,6 +5270,7 @@ def get_db() -> Generator[Session, Any, None]:
     finally:
         db.close()
 
+
 def get_for_update(db: Session, model, id=None, where: Optional[Any] = None, skip_locked: bool = True, options: Optional[List] = None):
     """Get entity with row lock for update operations.
 
@@ -5318,6 +5319,7 @@ def get_for_update(db: Session, model, id=None, where: Optional[Any] = None, ski
     # PostgreSQL: apply FOR UPDATE
     stmt = stmt.with_for_update(skip_locked=skip_locked)
     return db.execute(stmt).scalar_one_or_none()
+
 
 @contextmanager
 def fresh_db_session() -> Generator[Session, Any, None]:
