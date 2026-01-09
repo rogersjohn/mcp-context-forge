@@ -207,6 +207,81 @@ class TestIssue840UserInputForA2AAgentTest:
         assert "query" in expected_request_body, "Request body should include user query"
         assert expected_test_params["query"] == expected_request_body["query"], "Test params should use user's query"
 
+    @patch("mcpgateway.services.metrics_buffer_service.get_metrics_buffer_service")
+    @patch("mcpgateway.services.a2a_service.fresh_db_session")
+    @patch("mcpgateway.services.http_client_service.get_http_client")
+    async def test_custom_agent_receives_query_in_parameters(
+        self,
+        mock_get_client,
+        mock_fresh_db,
+        mock_metrics_buffer_fn,
+        a2a_service,
+        mock_db,
+        sample_a2a_agent,
+    ):
+        """Test that custom A2A agents receive query in parameters object.
+
+        Per A2A protocol, ContextForge sends custom agents requests in format:
+            {"interaction_type": "...", "parameters": {"query": "..."}, "protocol_version": "..."}
+
+        A2A-compliant agents should extract the query from parameters.query.
+
+        This test verifies that invoke_agent correctly sends the query
+        nested under the parameters object for custom agent types.
+        """
+        # Mock HTTP client to capture the actual request body
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"response": "The weather in Dallas is sunny"}
+        mock_client.post.return_value = mock_response
+        mock_get_client.return_value = mock_client
+
+        # Mock get_agent_by_name
+        a2a_service.get_agent_by_name = AsyncMock(return_value=sample_a2a_agent)
+
+        # Mock fresh_db_session
+        mock_ts_db = MagicMock()
+        mock_ts_db.execute.return_value.scalar_one_or_none.return_value = sample_a2a_agent
+        mock_fresh_db.return_value.__enter__.return_value = mock_ts_db
+        mock_fresh_db.return_value.__exit__.return_value = None
+
+        # Mock metrics buffer service
+        mock_metrics_buffer = MagicMock()
+        mock_metrics_buffer_fn.return_value = mock_metrics_buffer
+
+        # This is what the admin test endpoint sends for custom agents
+        test_params = {"query": "weather: Dallas", "message": "weather: Dallas", "test": True}
+
+        # Invoke the agent
+        await a2a_service.invoke_agent(
+            mock_db,
+            sample_a2a_agent.name,
+            test_params,
+            "admin_test",
+        )
+
+        # Verify the HTTP client was called
+        mock_client.post.assert_called_once()
+        call_args = mock_client.post.call_args
+
+        # Extract the JSON body that was sent to the agent
+        request_body = call_args.kwargs.get("json") or call_args[1].get("json")
+        assert request_body is not None, "Request body should not be None"
+
+        # Per A2A protocol for custom agents, verify the structure:
+        # {"interaction_type": "...", "parameters": {"query": "..."}, "protocol_version": "..."}
+        assert "parameters" in request_body, "Request should contain 'parameters' object"
+        assert "interaction_type" in request_body, "Request should contain 'interaction_type'"
+
+        # Verify the query is in parameters
+        params = request_body.get("parameters", {})
+        assert "query" in params or "message" in params, "parameters should contain query or message"
+
+        # Verify the actual query value
+        actual_query = params.get("query") or params.get("message")
+        assert actual_query == "weather: Dallas", f"Query should be 'weather: Dallas', got '{actual_query}'"
+
 
 class TestIssue840A2AToolsNotListedInGlobalTools:
     """Test suite for Issue #840 - Part 2: A2A tools not appearing in Global Tools.
