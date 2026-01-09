@@ -330,23 +330,40 @@ class A2AAgentService:
             metrics_cache.invalidate("a2a")
 
             # Automatically create a tool for the A2A agent if not already present
-            tool_service = ToolService()
-            tool_db = await tool_service.create_tool_from_a2a_agent(
-                db=db,
-                agent=new_agent,
-                created_by=created_by,
-                created_from_ip=created_from_ip,
-                created_via=created_via,
-                created_user_agent=created_user_agent,
-            )
+            # Tool creation is wrapped in try/except to ensure agent registration succeeds
+            # even if tool creation fails (e.g., due to visibility or permission issues)
+            tool_db = None
+            try:
+                tool_service = ToolService()
+                tool_db = await tool_service.create_tool_from_a2a_agent(
+                    db=db,
+                    agent=new_agent,
+                    created_by=created_by,
+                    created_from_ip=created_from_ip,
+                    created_via=created_via,
+                    created_user_agent=created_user_agent,
+                )
 
-            # Associate the tool with the agent using the relationship
-            # This sets both the tool_id foreign key and the tool relationship
-            new_agent.tool = tool_db
-            db.commit()
-            db.refresh(new_agent)
-
-            logger.info(f"Registered new A2A agent: {new_agent.name} (ID: {new_agent.id}) with tool ID: {tool_db.id}")
+                # Associate the tool with the agent using the relationship
+                # This sets both the tool_id foreign key and the tool relationship
+                new_agent.tool = tool_db
+                db.commit()
+                db.refresh(new_agent)
+                logger.info(f"Registered new A2A agent: {new_agent.name} (ID: {new_agent.id}) with tool ID: {tool_db.id}")
+            except Exception as tool_error:
+                # Log the error but don't fail agent registration
+                logger.warning(f"Failed to create tool for A2A agent {new_agent.name}: {tool_error}")
+                structured_logger.warning(
+                    f"A2A agent '{new_agent.name}' created without tool association",
+                    user_id=created_by,
+                    resource_type="a2a_agent",
+                    resource_id=str(new_agent.id),
+                    custom_fields={"error": str(tool_error), "agent_name": new_agent.name},
+                )
+                # Still commit the agent without a tool
+                db.commit()
+                db.refresh(new_agent)
+                logger.info(f"Registered new A2A agent: {new_agent.name} (ID: {new_agent.id}) without tool")
 
             # Log A2A agent registration for lifecycle tracking
             structured_logger.info(
